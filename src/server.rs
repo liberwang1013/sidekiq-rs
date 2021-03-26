@@ -1,28 +1,28 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use redis::{Pipeline, PipelineCommands};
-use r2d2::{Pool, Config};
+use r2d2::Pool;
 use r2d2_redis::RedisConnectionManager;
+use redis::{Pipeline};
 
-use rand::Rng;
+use rand::{Rng, distributions::Alphanumeric};
 
 use threadpool::ThreadPool;
 
-use chan::{sync, after, tick, Receiver, Sender};
-use chan_signal::{Signal as SysSignal, notify};
+use chan::{after, sync, tick, Receiver, Sender};
+use chan_signal::{notify, Signal as SysSignal};
 
 use libc::getpid;
 
-use chrono::UTC;
+use chrono::Utc;
 
 use serde_json::to_string;
 
-use worker::SidekiqWorker;
 use errors::*;
-use utils::rust_gethostname;
-use middleware::MiddleWare;
 use job_handler::JobHandler;
+use middleware::MiddleWare;
+use utils::rust_gethostname;
+use worker::SidekiqWorker;
 use RedisPool;
 
 #[derive(Debug)]
@@ -41,8 +41,8 @@ pub struct SidekiqServer<'a> {
     redispool: RedisPool,
     threadpool: ThreadPool,
     pub namespace: String,
-    job_handlers: BTreeMap<String, Box<JobHandler + 'a>>,
-    middlewares: Vec<Box<MiddleWare + 'a>>,
+    job_handlers: BTreeMap<String, Box<dyn JobHandler + 'a>>,
+    middlewares: Vec<Box<dyn MiddleWare + 'a>>,
     queues: Vec<String>,
     weights: Vec<f64>,
     started_at: f64,
@@ -59,15 +59,12 @@ impl<'a> SidekiqServer<'a> {
 
     pub fn new(redis: &str, concurrency: usize) -> Result<Self> {
         let signal = notify(&[SysSignal::INT, SysSignal::USR1]); // should be here to set proper signal mask to all threads
-        let now = UTC::now();
-        let config = Config::builder()
-            .pool_size(concurrency as u32 + 3) // dunno why, it corrupt for unable to get connection sometimes with concurrency + 1
-            .build();
-        let manager = try!(RedisConnectionManager::new(redis));
-        let pool = try!(Pool::new(config, manager));
+        let now = Utc::now();
+        let manager = RedisConnectionManager::new(redis)?;
+        let pool = Pool::new(manager)?;
         Ok(SidekiqServer {
             redispool: pool,
-            threadpool: ThreadPool::new_with_name("worker".into(), concurrency),
+            threadpool: ThreadPool::with_name("worker".into(), concurrency),
             namespace: String::new(),
             job_handlers: BTreeMap::new(),
             queues: vec![],
@@ -80,7 +77,7 @@ impl<'a> SidekiqServer<'a> {
             force_quite_timeout: 10,
             middlewares: vec![],
             // random itentity
-            rs: ::rand::thread_rng().gen_ascii_chars().take(12).collect(),
+            rs: ::rand::thread_rng().sample_iter(Alphanumeric).map(char::from).take(12).collect(),
         })
     }
 
@@ -126,7 +123,7 @@ impl<'a> SidekiqServer<'a> {
                             break;
                         }
                         Some(signal @ SysSignal::INT) => {
-                            info!("{:?}: Force terminating", signal);                            
+                            info!("{:?}: Force terminating", signal);
                             self.terminate_forcely(tox2, rsx2);
                             break;
                         }
@@ -160,27 +157,27 @@ impl<'a> SidekiqServer<'a> {
 
     // Worker start/terminate functions
 
-
     fn launch_workers(&mut self, tsx: Sender<Signal>, rox: Receiver<Operation>) {
         while self.worker_info.len() < self.concurrency {
             self.launch_worker(tsx.clone(), rox.clone());
         }
     }
 
-
     fn launch_worker(&mut self, tsx: Sender<Signal>, rox: Receiver<Operation>) {
-        let worker = SidekiqWorker::new(&self.identity(),
-                                        self.redispool.clone(),
-                                        tsx,
-                                        rox,
-                                        self.queues.clone(),
-                                        self.weights.clone(),
-                                        self.job_handlers
-                                            .iter_mut()
-                                            .map(|(k, v)| (k.clone(), v.cloned()))
-                                            .collect(),
-                                        self.middlewares.iter_mut().map(|v| v.cloned()).collect(),
-                                        self.namespace.clone());
+        let worker = SidekiqWorker::new(
+            &self.identity(),
+            self.redispool.clone(),
+            tsx,
+            rox,
+            self.queues.clone(),
+            self.weights.clone(),
+            self.job_handlers
+                .iter_mut()
+                .map(|(k, v)| (k.clone(), v.cloned()))
+                .collect(),
+            self.middlewares.iter_mut().map(|v| v.cloned()).collect(),
+            self.namespace.clone(),
+        );
         self.worker_info.insert(worker.id.clone(), false);
         self.threadpool.execute(move || worker.work());
     }
@@ -215,7 +212,6 @@ impl<'a> SidekiqServer<'a> {
         }
     }
 
-
     fn terminate_gracefully(&mut self, tox: Sender<Operation>, rsx: Receiver<Signal>) {
         self.inform_termination(tox);
 
@@ -236,16 +232,15 @@ impl<'a> SidekiqServer<'a> {
         }
     }
 
-
     fn deal_signal(&mut self, sig: Signal) -> Result<()> {
         debug!("dealing signal {:?}", sig);
         match sig {
             Signal::Complete(id, n) => {
-                let _ = try!(self.report_processed(n));
+                let _ = self.report_processed(n)?;
                 *self.worker_info.get_mut(&id).unwrap() = false;
             }
             Signal::Fail(id, n) => {
-                let _ = try!(self.report_failed(n));
+                let _ = self.report_failed(n)?;
                 *self.worker_info.get_mut(&id).unwrap() = false;
             }
             Signal::Acquire(id) => {
@@ -261,60 +256,71 @@ impl<'a> SidekiqServer<'a> {
 
     // Sidekiq dashboard reporting functions
 
-
     fn report_alive(&mut self) -> Result<()> {
-        let now = UTC::now();
+        let now = Utc::now();
 
-        let content = vec![("info",
-                            to_string(&json!({
-                                "hostname": rust_gethostname().unwrap_or("unknown".into()),
-                                "started_at": self.started_at,
-                                "pid": self.pid,
-                                "concurrency": self.concurrency,
-                                "queues": self.queues.clone(),
-                                "labels": [],
-                                "identity": self.identity()
-                            }))
-                                .unwrap()),
-                           ("busy", self.worker_info.values().filter(|v| **v).count().to_string()),
-                           ("beat",
-                            (now.timestamp() as f64 +
-                             now.timestamp_subsec_micros() as f64 / 1000000f64)
-                                .to_string())];
-        let conn = try!(self.redispool.get());
-        try!(Pipeline::new()
+        let content = vec![
+            (
+                "info",
+                to_string(&json!({
+                    "hostname": rust_gethostname().unwrap_or("unknown".into()),
+                    "started_at": self.started_at,
+                    "pid": self.pid,
+                    "concurrency": self.concurrency,
+                    "queues": self.queues.clone(),
+                    "labels": [],
+                    "identity": self.identity()
+                }))
+                .unwrap(),
+            ),
+            (
+                "busy",
+                self.worker_info
+                    .values()
+                    .filter(|v| **v)
+                    .count()
+                    .to_string(),
+            ),
+            (
+                "beat",
+                (now.timestamp() as f64 + now.timestamp_subsec_micros() as f64 / 1000000f64)
+                    .to_string(),
+            ),
+        ];
+        let mut conn = self.redispool.get()?;
+        Pipeline::new()
             .hset_multiple(self.with_namespace(&self.identity()), &content)
             .expire(self.with_namespace(&self.identity()), 5)
             .sadd(self.with_namespace(&"processes"), self.identity())
-            .query::<()>(&*conn));
+            .query::<()>(&mut *conn)?;
 
         Ok(())
-
     }
-
 
     fn report_processed(&mut self, n: usize) -> Result<()> {
-        let connection = try!(self.redispool.get());
-        let _: () = Pipeline::new().incr(self.with_namespace(&format!("stat:processed:{}",
-                                               UTC::now().format("%Y-%m-%d"))),
-                  n)
+        let mut connection = self.redispool.get()?;
+        let _: () = Pipeline::new()
+            .incr(
+                self.with_namespace(&format!("stat:processed:{}", Utc::now().format("%Y-%m-%d"))),
+                n,
+            )
             .incr(self.with_namespace(&format!("stat:processed")), n)
-            .query(&*connection)?;
+            .query(&mut *connection)?;
 
         Ok(())
     }
-
 
     fn report_failed(&mut self, n: usize) -> Result<()> {
-        let connection = try!(self.redispool.get());
+        let mut connection = self.redispool.get()?;
         let _: () = Pipeline::new()
-            .incr(self.with_namespace(&format!("stat:failed:{}", UTC::now().format("%Y-%m-%d"))),
-                  n)
+            .incr(
+                self.with_namespace(&format!("stat:failed:{}", Utc::now().format("%Y-%m-%d"))),
+                n,
+            )
             .incr(self.with_namespace(&format!("stat:failed")), n)
-            .query(&*connection)?;
+            .query(&mut *connection)?;
         Ok(())
     }
-
 
     fn identity(&self) -> String {
         let host = rust_gethostname().unwrap_or("unknown".into());
@@ -322,7 +328,6 @@ impl<'a> SidekiqServer<'a> {
 
         host + ":" + &pid.to_string() + ":" + &self.rs
     }
-
 
     fn with_namespace(&self, snippet: &str) -> String {
         if self.namespace == "" {

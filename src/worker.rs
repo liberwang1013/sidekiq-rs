@@ -10,12 +10,12 @@ use chan::{Sender, Receiver, tick};
 
 use serde_json::from_str;
 use errors::*;
-use redis::{Commands, PipelineCommands, Pipeline};
+use redis::{Commands, Pipeline};
 
 
 use rand::Rng;
 use serde_json::{to_string, Value as JValue};
-use chrono::UTC;
+use chrono::Utc;
 
 use server::{Signal, Operation};
 use job::Job;
@@ -32,8 +32,8 @@ pub struct SidekiqWorker<'a> {
     namespace: String,
     queues: Vec<String>,
     weights: Vec<f64>,
-    handlers: BTreeMap<String, Box<JobHandler + 'a>>,
-    middlewares: Vec<Box<MiddleWare + 'a>>,
+    handlers: BTreeMap<String, Box<dyn JobHandler + 'a>>,
+    middlewares: Vec<Box<dyn MiddleWare + 'a>>,
     tx: Sender<Signal>,
     rx: Receiver<Operation>,
     processed: usize,
@@ -47,12 +47,12 @@ impl<'a> SidekiqWorker<'a> {
                rx: Receiver<Operation>,
                queues: Vec<String>,
                weights: Vec<f64>,
-               handlers: BTreeMap<String, Box<JobHandler>>,
-               middlewares: Vec<Box<MiddleWare>>,
+               handlers: BTreeMap<String, Box<dyn JobHandler>>,
+               middlewares: Vec<Box<dyn MiddleWare>>,
                namespace: String)
                -> SidekiqWorker<'a> {
         SidekiqWorker {
-            id: ::rand::thread_rng().gen_ascii_chars().take(9).collect(),
+            id: ::rand::thread_rng().sample_iter(rand::distributions::Alphanumeric).map(char::from).take(9).collect(),
             server_id: server_id.into(),
             pool: pool,
             namespace: namespace,
@@ -121,7 +121,7 @@ impl<'a> SidekiqWorker<'a> {
             let mut job: Job = from_str(&result[1])?;
             self.tx.send(Signal::Acquire(self.id.clone()));
             if let Some(ref mut retry_info) = job.retry_info {
-                retry_info.retried_at = Some(UTC::now());
+                retry_info.retried_at = Some(Utc::now());
             }
 
             job.namespace = self.namespace.clone();
@@ -153,7 +153,7 @@ impl<'a> SidekiqWorker<'a> {
                 error!("Worker '{}' panicked, recovering", self.id);
                 Err("Worker crashed".into())
             }
-            Ok(r) => Ok(try!(r)),
+            Ok(r) => Ok(r?),
         }
     }
 
@@ -162,7 +162,7 @@ impl<'a> SidekiqWorker<'a> {
     {
         fn imp<'a, F: FnMut(&Job) -> JobHandlerResult>(job: &mut Job,
                                                        redis: RedisPool,
-                                                       chain: &mut [Box<MiddleWare + 'a>],
+                                                       chain: &mut [Box<dyn MiddleWare + 'a>],
                                                        job_handle: &mut F)
                                                        -> Result<JobSuccessType> {
             chain.split_first_mut()
@@ -198,17 +198,17 @@ impl<'a> SidekiqWorker<'a> {
 
 
     fn report_working(&self, job: &Job) -> Result<()> {
-        let conn = try!(self.pool.get());
+        let mut conn = self.pool.get()?;
         let payload: JValue = json!({
             "queue": job.queue.clone(),
             "payload": job,
-            "run_at": UTC::now().timestamp()
+            "run_at": Utc::now().timestamp()
         });
         let _: () = Pipeline::new().hset(&self.with_namespace(&self.with_server_id("workers")),
                   &self.id,
                   to_string(&payload).unwrap())
             .expire(&self.with_namespace(&self.with_server_id("workers")), 5)
-            .query(&*conn)?;
+            .query(&mut *conn)?;
 
         Ok(())
     }
